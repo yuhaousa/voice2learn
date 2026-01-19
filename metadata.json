@@ -1,0 +1,7 @@
+{
+  "name": "EduSpark K-12 AI Tutor",
+  "description": "An interactive, voice-first tutoring platform for K-12 students using Gemini 2.5 Live API for real-time conversational learning.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
