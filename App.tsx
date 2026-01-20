@@ -25,7 +25,7 @@ const App: React.FC = () => {
     <div className="min-h-screen pb-20">
       {/* Header */}
       <header className="bg-white border-b border-indigo-100 sticky top-0 z-10 shadow-sm">
-        <div className="max-w-7xl mx-auto px-6 h-20 flex items-center justify-between">
+        <div className="max-w-[1400px] mx-auto px-6 h-20 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className="text-3xl">✨</span>
             <span className="text-2xl font-heading font-bold bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent">
@@ -45,7 +45,7 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-6 mt-12">
+      <main className="max-w-[1400px] mx-auto px-6 mt-12">
         {/* Welcome Section */}
         <div className="flex flex-col md:flex-row items-center justify-between gap-12 mb-16">
           <div className="flex-1 space-y-6">
@@ -166,7 +166,7 @@ const App: React.FC = () => {
       </main>
 
       <footer className="mt-24 border-t border-slate-100 py-12">
-        <div className="max-w-7xl mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-8">
+        <div className="max-w-[1400px] mx-auto px-6 flex flex-col md:flex-row items-center justify-between gap-8">
           <div className="flex items-center gap-2 grayscale">
             <span className="text-2xl">✨</span>
             <span className="text-xl font-heading font-bold text-slate-400">EduSpark</span>

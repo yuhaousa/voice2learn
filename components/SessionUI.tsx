@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality, Type, FunctionDeclaration } from '@google/genai';
 import { SessionConfig, ChatMessage } from '../types';
 import { TUTOR_SYSTEM_INSTRUCTION } from '../constants';
@@ -7,37 +7,37 @@ import { decode, decodeAudioData, createPcmBlob } from '../services/audioUtils';
 import AudioVisualizer from './AudioVisualizer';
 import Whiteboard, { WhiteboardHandle } from './Whiteboard';
 
+interface LearningMaterial {
+  title: string;
+  content: string;
+  imageUrl?: string;
+  isGenerating?: boolean;
+}
+
 interface SessionUIProps {
   config: SessionConfig;
   onEnd: () => void;
 }
 
+type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error' | 'ready_to_start';
+
+const formatAIText = (text: string): string => {
+  return text.replace(/([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])/g, '$1$2');
+};
+
 const DRAW_TOOL: FunctionDeclaration = {
   name: 'draw_on_whiteboard',
   parameters: {
     type: Type.OBJECT,
-    description: 'Allows the tutor to draw shapes or write text on the whiteboard to explain concepts.',
+    description: 'Allows the tutor to draw shapes or write text on the whiteboard.',
     properties: {
-      action: {
-        type: Type.STRING,
-        description: 'The type of drawing action to perform.',
-        enum: ['draw_rect', 'draw_circle', 'draw_line', 'write_text', 'clear'],
-      },
+      action: { type: Type.STRING, enum: ['draw_rect', 'draw_circle', 'draw_line', 'write_text', 'clear'] },
       params: {
         type: Type.OBJECT,
-        description: 'Parameters for the drawing action. Coordinates (x, y) are 0-100 relative to board size.',
         properties: {
-          x: { type: Type.NUMBER },
-          y: { type: Type.NUMBER },
-          w: { type: Type.NUMBER, description: 'Width for rectangles' },
-          h: { type: Type.NUMBER, description: 'Height for rectangles' },
-          r: { type: Type.NUMBER, description: 'Radius for circles' },
-          x1: { type: Type.NUMBER },
-          y1: { type: Type.NUMBER },
-          x2: { type: Type.NUMBER },
-          y2: { type: Type.NUMBER },
-          text: { type: Type.STRING },
-          color: { type: Type.STRING, description: 'Hex color string' }
+          x: { type: Type.NUMBER }, y: { type: Type.NUMBER }, w: { type: Type.NUMBER }, h: { type: Type.NUMBER },
+          r: { type: Type.NUMBER }, x1: { type: Type.NUMBER }, y1: { type: Type.NUMBER }, x2: { type: Type.NUMBER },
+          y2: { type: Type.NUMBER }, text: { type: Type.STRING }, color: { type: Type.STRING }
         }
       }
     },
@@ -45,279 +45,467 @@ const DRAW_TOOL: FunctionDeclaration = {
   }
 };
 
+const MATERIAL_TOOL: FunctionDeclaration = {
+  name: 'show_learning_material',
+  parameters: {
+    type: Type.OBJECT,
+    description: 'Displays an educational card. Can generate images.',
+    properties: {
+      title: { type: Type.STRING },
+      content: { type: Type.STRING },
+      imageUrl: { type: Type.STRING },
+      image_prompt: { type: Type.STRING },
+      action: { type: Type.STRING, enum: ['show', 'hide'] }
+    },
+    required: ['title', 'content', 'action']
+  }
+};
+
 const SessionUI: React.FC<SessionUIProps> = ({ config, onEnd }) => {
-  const [isConnecting, setIsConnecting] = useState(true);
+  const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [isSpeaking, setIsSpeaking] = useState(false);
-  const [isPaused, setIsPaused] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [transcriptState, setTranscriptState] = useState({ user: '', model: '' });
-  const [error, setError] = useState<string | null>(null);
-  const [viewMode, setViewMode] = useState<'canvas' | 'visualizer'>('canvas');
+  const [viewMode, setViewMode] = useState<'canvas' | 'materials' | 'visualizer'>('materials');
+  const [currentMaterial, setCurrentMaterial] = useState<LearningMaterial | null>(null);
+  const [hasNewMaterial, setHasNewMaterial] = useState(false);
 
   const audioContextsRef = useRef<{ input: AudioContext; output: AudioContext } | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const nextStartTimeRef = useRef(0);
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionRef = useRef<any>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const whiteboardRef = useRef<WhiteboardHandle>(null);
-  const transcriptRef = useRef({ user: '', model: '' });
+  const transcriptTextRef = useRef({ user: '', model: '' });
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  
+  const isConnectingRef = useRef(false);
+  const isConnectedRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimeoutRef = useRef<number | null>(null);
 
+  // Auto-scroll logic with enhanced precision
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    if (scrollContainerRef.current) {
+      const container = scrollContainerRef.current;
+      container.scrollTo({
+        top: container.scrollHeight,
+        behavior: 'smooth'
+      });
     }
-  }, [messages, transcriptState]);
+  }, [messages, transcriptState.user, transcriptState.model]);
 
-  useEffect(() => {
-    let isMounted = true;
+  const cleanupAudio = useCallback(() => {
+    activeSourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
+    activeSourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
+    setIsSpeaking(false);
+  }, []);
 
-    const startSession = async () => {
-      try {
-        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const stopEverything = useCallback(() => {
+    cleanupAudio();
+    isConnectedRef.current = false;
+    isConnectingRef.current = false;
+    
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+
+    if (sessionRef.current) {
+      try { sessionRef.current.close(); } catch(e) {}
+      sessionRef.current = null;
+    }
+    sessionPromiseRef.current = null;
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+  }, [cleanupAudio]);
+
+  const downloadMaterialImage = () => {
+    if (currentMaterial?.imageUrl) {
+      const link = document.createElement('a');
+      link.download = `eduspark-material-${Date.now()}.png`;
+      link.href = currentMaterial.imageUrl;
+      link.click();
+    }
+  };
+
+  const generateImageForMaterial = async (prompt: string) => {
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash-image',
+        contents: { parts: [{ text: `High quality educational illustration for student: ${prompt}` }] },
+        config: { imageConfig: { aspectRatio: "16:9" } }
+      });
+      const imagePart = response.candidates[0].content.parts.find(p => p.inlineData);
+      if (imagePart?.inlineData) {
+        const url = `data:${imagePart.inlineData.mimeType};base64,${imagePart.inlineData.data}`;
+        setCurrentMaterial(prev => prev ? { ...prev, imageUrl: url, isGenerating: false } : null);
+      }
+    } catch (err) {
+      console.error("Image generation failed:", err);
+      setCurrentMaterial(prev => prev ? { ...prev, isGenerating: false } : null);
+    }
+  };
+
+  const activateAudioAndGreet = async () => {
+    try {
+      if (audioContextsRef.current) {
+        await audioContextsRef.current.output.resume();
+        await audioContextsRef.current.input.resume();
+      }
+      
+      // Ensure session exists before marking as connected
+      if (sessionRef.current) {
+        isConnectedRef.current = true;
+        setStatus('connected');
+        
+        const greetingPrompt = config.subject.id === 'chinese'
+          ? `[SYSTEM: 立即开始。用非常热情的声音问候学生，大声介绍你自己是 EduSpark 老师。]`
+          : `[SYSTEM: Start now. Greet the student enthusiastically and introduce yourself as EduSpark.]`;
+          
+        sessionRef.current.send({
+          clientContent: { turns: [{ role: 'user', parts: [{ text: greetingPrompt }] }], turnComplete: true }
+        });
+      }
+    } catch (err) {
+      console.error("Activation failed", err);
+    }
+  };
+
+  const connectToLiveAPI = useCallback(async (isReconnect = false) => {
+    if (isConnectingRef.current) return;
+    isConnectingRef.current = true;
+    
+    if (!isReconnect) {
+      setStatus('connecting');
+      stopEverything();
+    } else {
+      setStatus('reconnecting');
+      cleanupAudio();
+      if (sessionRef.current) try { sessionRef.current.close(); } catch(e) {}
+    }
+
+    try {
+      if (!audioContextsRef.current) {
         const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
         const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
         audioContextsRef.current = { input: inputCtx, output: outputCtx };
+      }
 
+      if (!streamRef.current) {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        streamRef.current = stream;
+      }
+      
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const sessionPromise = ai.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        callbacks: {
+          onopen: () => {
+            console.log("Live Session Opened");
+            reconnectAttemptsRef.current = 0;
+            isConnectingRef.current = false;
+            
+            if (isReconnect) {
+              isConnectedRef.current = true;
+              setStatus('connected');
+            } else {
+              // Wait for user gesture to mark as actually "connected"
+              setStatus('ready_to_start');
+            }
 
-        const sessionPromise = ai.live.connect({
-          model: 'gemini-2.5-flash-native-audio-preview-12-2025',
-          callbacks: {
-            onopen: () => {
-              if (!isMounted) return;
-              setIsConnecting(false);
-              const source = inputCtx.createMediaStreamSource(stream);
-              const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
-              scriptProcessor.onaudioprocess = (e) => {
-                if (isPaused) return; // Stop sending when paused
-                const inputData = e.inputBuffer.getChannelData(0);
-                const pcmBlob = createPcmBlob(inputData);
-                sessionPromise.then((session) => {
-                  session.sendRealtimeInput({ media: pcmBlob });
-                });
-              };
-              source.connect(scriptProcessor);
-              scriptProcessor.connect(inputCtx.destination);
-            },
-            onmessage: async (message: LiveServerMessage) => {
-              if (!isMounted) return;
-
-              // Handle function calls (Drawing)
-              if (message.toolCall) {
-                for (const fc of message.toolCall.functionCalls) {
-                  if (fc.name === 'draw_on_whiteboard') {
-                    whiteboardRef.current?.tutorDraw(fc.args.action, fc.args.params);
-                    sessionPromise.then(s => s.sendToolResponse({
-                      functionResponses: { id: fc.id, name: fc.name, response: { result: "ok" } }
-                    }));
+            const source = audioContextsRef.current!.input.createMediaStreamSource(streamRef.current!);
+            const scriptProcessor = audioContextsRef.current!.input.createScriptProcessor(4096, 1, 1);
+            scriptProcessor.onaudioprocess = (e) => {
+              // Strictly only send input if explicitly connected via button
+              if (!isConnectedRef.current) return; 
+              const inputData = e.inputBuffer.getChannelData(0);
+              const pcmBlob = createPcmBlob(inputData);
+              sessionPromise.then(s => {
+                if (s && isConnectedRef.current) {
+                  try { s.sendRealtimeInput({ media: pcmBlob }); } catch(err) {}
+                }
+              });
+            };
+            source.connect(scriptProcessor);
+            scriptProcessor.connect(audioContextsRef.current!.input.destination);
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            if (message.toolCall) {
+              for (const fc of message.toolCall.functionCalls) {
+                if (fc.name === 'draw_on_whiteboard') {
+                  whiteboardRef.current?.tutorDraw(fc.args.action, fc.args.params);
+                  sessionPromise.then(s => s?.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: { result: "ok" } } }));
+                } else if (fc.name === 'show_learning_material') {
+                  if (fc.args.action === 'show') {
+                    setCurrentMaterial({ 
+                      title: formatAIText(fc.args.title), 
+                      content: formatAIText(fc.args.content), 
+                      imageUrl: fc.args.imageUrl,
+                      isGenerating: !!fc.args.image_prompt
+                    });
+                    setHasNewMaterial(true);
+                    setViewMode('materials');
+                    if (fc.args.image_prompt) generateImageForMaterial(fc.args.image_prompt);
                   }
+                  sessionPromise.then(s => s?.sendToolResponse({ functionResponses: { id: fc.id, name: fc.name, response: { result: "ok" } } }));
                 }
               }
+            }
 
-              // Skip processing audio/text if paused (though usually pause stops input)
-              if (isPaused) return;
+            if (message.serverContent?.outputTranscription) {
+              transcriptTextRef.current.model += message.serverContent.outputTranscription.text;
+              setTranscriptState(prev => ({ ...prev, model: formatAIText(transcriptTextRef.current.model) }));
+            } else if (message.serverContent?.inputTranscription) {
+              transcriptTextRef.current.user += message.serverContent.inputTranscription.text;
+              setTranscriptState(prev => ({ ...prev, user: transcriptTextRef.current.user }));
+            }
 
-              if (message.serverContent?.outputTranscription) {
-                const text = message.serverContent.outputTranscription.text;
-                transcriptRef.current.model += text;
-                setTranscriptState(prev => ({ ...prev, model: transcriptRef.current.model }));
-              } else if (message.serverContent?.inputTranscription) {
-                const text = message.serverContent.inputTranscription.text;
-                transcriptRef.current.user += text;
-                setTranscriptState(prev => ({ ...prev, user: transcriptRef.current.user }));
+            if (message.serverContent?.turnComplete) {
+              const uTxt = transcriptTextRef.current.user;
+              const mTxt = formatAIText(transcriptTextRef.current.model);
+              if (uTxt.trim() || mTxt.trim()) {
+                setMessages(prev => [
+                  ...prev,
+                  ...(uTxt.trim() ? [{ id: `u-${Date.now()}`, role: 'user' as const, text: uTxt, timestamp: Date.now() }] : []),
+                  ...(mTxt.trim() ? [{ id: `m-${Date.now()}`, role: 'model' as const, text: mTxt, timestamp: Date.now() }] : [])
+                ]);
               }
+              transcriptTextRef.current = { user: '', model: '' };
+              setTranscriptState({ user: '', model: '' });
+            }
 
-              if (message.serverContent?.turnComplete) {
-                const finalUser = transcriptRef.current.user;
-                const finalModel = transcriptRef.current.model;
-                if (finalUser.trim() || finalModel.trim()) {
-                  setMessages(prev => [
-                    ...prev,
-                    ...(finalUser.trim() ? [{ id: `user-${Date.now()}`, role: 'user' as const, text: finalUser, timestamp: Date.now() }] : []),
-                    ...(finalModel.trim() ? [{ id: `model-${Date.now()}`, role: 'model' as const, text: finalModel, timestamp: Date.now() }] : [])
-                  ]);
-                }
-                transcriptRef.current = { user: '', model: '' };
-                setTranscriptState({ user: '', model: '' });
-              }
-
-              const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-              if (base64Audio && !isPaused) {
-                setIsSpeaking(true);
-                const outputCtx = audioContextsRef.current?.output;
-                if (!outputCtx) return;
-                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputCtx.currentTime);
-                const audioBuffer = await decodeAudioData(decode(base64Audio), outputCtx, 24000, 1);
-                const source = outputCtx.createBufferSource();
+            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            if (base64Audio) {
+              setIsSpeaking(true);
+              const oCtx = audioContextsRef.current?.output;
+              if (oCtx) {
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, oCtx.currentTime);
+                const audioBuffer = await decodeAudioData(decode(base64Audio), oCtx, 24000, 1);
+                const source = oCtx.createBufferSource();
                 source.buffer = audioBuffer;
-                const gainNode = outputCtx.createGain();
-                source.connect(gainNode);
-                gainNode.connect(outputCtx.destination);
-                source.addEventListener('ended', () => {
+                source.connect(oCtx.destination);
+                source.onended = () => {
                   activeSourcesRef.current.delete(source);
                   if (activeSourcesRef.current.size === 0) setIsSpeaking(false);
-                });
+                };
                 source.start(nextStartTimeRef.current);
                 nextStartTimeRef.current += audioBuffer.duration;
                 activeSourcesRef.current.add(source);
               }
-
-              if (message.serverContent?.interrupted) {
-                activeSourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
-                activeSourcesRef.current.clear();
-                nextStartTimeRef.current = 0;
-                setIsSpeaking(false);
-              }
-            },
-            onerror: (e) => {
-              console.error('Session Error:', e);
-              setError("Oops! Something went wrong with the connection.");
-            },
-            onclose: () => { if (isMounted) onEnd(); }
+            }
+            if (message.serverContent?.interrupted) cleanupAudio();
           },
-          config: {
-            responseModalities: [Modality.AUDIO],
-            systemInstruction: TUTOR_SYSTEM_INSTRUCTION(config.grade, config.subject.name),
-            tools: [{ functionDeclarations: [DRAW_TOOL] }],
-            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
-            outputAudioTranscription: {},
-            inputAudioTranscription: {},
+          onerror: (e) => { 
+            console.error('Session Error:', e);
+            handleDisconnect();
+          },
+          onclose: () => { 
+            console.log('Session Closed');
+            handleDisconnect();
           }
-        });
-        sessionRef.current = await sessionPromise;
-      } catch (err) {
-        console.error('Start Session Error:', err);
-        setError("Could not access microphone or connect to EduSpark.");
-      }
-    };
+        },
+        config: {
+          responseModalities: [Modality.AUDIO],
+          systemInstruction: TUTOR_SYSTEM_INSTRUCTION(config.grade, config.subject.name),
+          tools: [{ functionDeclarations: [DRAW_TOOL, MATERIAL_TOOL] }],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } },
+          outputAudioTranscription: {},
+          inputAudioTranscription: {},
+        }
+      });
+      sessionPromiseRef.current = sessionPromise;
+      sessionRef.current = await sessionPromise;
+    } catch (err) {
+      console.error("Connection failed", err);
+      handleDisconnect();
+    }
+  }, [config, cleanupAudio, stopEverything]);
 
-    startSession();
+  const handleDisconnect = useCallback(() => {
+    isConnectedRef.current = false;
+    isConnectingRef.current = false;
+    
+    if (reconnectAttemptsRef.current < 5) {
+      const delay = Math.pow(2, reconnectAttemptsRef.current) * 1000;
+      reconnectAttemptsRef.current++;
+      setStatus('reconnecting');
+      reconnectTimeoutRef.current = window.setTimeout(() => {
+        connectToLiveAPI(true);
+      }, delay);
+    } else {
+      setStatus('error');
+    }
+  }, [connectToLiveAPI]);
 
-    return () => {
-      isMounted = false;
-      if (sessionRef.current) sessionRef.current.close();
-      if (audioContextsRef.current) {
-        audioContextsRef.current.input.close();
-        audioContextsRef.current.output.close();
-      }
-    };
-  }, [config, onEnd]);
-
-  // Handle Pause/Resume UI side
   useEffect(() => {
-    if (isPaused) {
-      // Clear active audio buffers to silent the tutor immediately
-      activeSourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
-      activeSourcesRef.current.clear();
-      setIsSpeaking(false);
-    }
-  }, [isPaused]);
-
-  const handleWhiteboardFrame = (base64: string) => {
-    if (sessionRef.current && !isPaused) {
-      sessionRef.current.sendRealtimeInput({ media: { data: base64, mimeType: 'image/jpeg' } });
-    }
-  };
-
-  if (error) {
-    return (
-      <div className="flex flex-col items-center justify-center p-8 bg-white rounded-3xl shadow-xl border border-red-100 max-w-lg mx-auto mt-20">
-        <div className="text-4xl mb-4">⚠️</div>
-        <h2 className="text-xl font-bold text-red-600 mb-2">Connection Problem</h2>
-        <p className="text-slate-600 text-center mb-6">{error}</p>
-        <button onClick={onEnd} className="px-6 py-2 bg-slate-900 text-white rounded-full hover:bg-slate-800 transition">Go Back</button>
-      </div>
-    );
-  }
+    // Start initial connection setup
+    connectToLiveAPI();
+    return stopEverything;
+  }, []);
 
   return (
-    <div className="max-w-6xl mx-auto px-4 py-8 h-screen flex flex-col overflow-hidden">
-      <div className="flex items-center justify-between mb-6 shrink-0">
-        <div className="flex items-center gap-4">
-          <div className={`w-10 h-10 rounded-xl ${config.subject.color} flex items-center justify-center text-xl shadow-md`}>{config.subject.icon}</div>
-          <div>
-            <h1 className="text-xl font-bold font-heading text-slate-900">{config.subject.name} Session</h1>
-            <p className="text-slate-500 text-xs font-medium uppercase tracking-wider">{config.grade}</p>
+    <div className="max-w-[1400px] mx-auto px-4 py-8 h-screen flex flex-col overflow-hidden relative font-sans">
+      {/* Enhanced Initialization Overlay */}
+      {(status === 'ready_to_start' || status === 'connecting') && (
+        <div className="absolute inset-0 z-[100] bg-indigo-600/95 backdrop-blur-2xl flex items-center justify-center p-6 animate-in fade-in duration-500">
+          <div className="bg-white rounded-[4rem] p-16 shadow-2xl max-w-xl w-full text-center space-y-12 border-[16px] border-white/20 transform transition-all scale-100 hover:scale-[1.01]">
+            <div className="relative mx-auto w-32 h-32 flex items-center justify-center">
+               <div className="absolute inset-0 bg-indigo-50 rounded-full animate-ping opacity-20"></div>
+               <div className="text-9xl relative z-10 animate-bounce drop-shadow-xl">👩‍🏫</div>
+            </div>
+            
+            <div className="space-y-4">
+              <h2 className="text-5xl font-black text-slate-900 font-heading tracking-tight">
+                {status === 'connecting' ? 'Setting up Class...' : 'Teacher is Ready!'}
+              </h2>
+              <p className="text-2xl text-slate-600 font-medium leading-relaxed">
+                {status === 'connecting' 
+                  ? 'Connecting to the EduSpark smart classroom...' 
+                  : 'Your classroom is ready. Shall we begin the lesson?'}
+              </p>
+            </div>
+
+            {status === 'ready_to_start' ? (
+              <button 
+                onClick={activateAudioAndGreet} 
+                className="w-full py-8 bg-indigo-600 hover:bg-indigo-700 text-white rounded-[3rem] font-black text-3xl shadow-2xl transition-all active:scale-95 flex items-center justify-center gap-4 group"
+              >
+                🚀 START LESSON
+                <span className="group-hover:translate-x-2 transition-transform">→</span>
+              </button>
+            ) : (
+              <div className="flex flex-col items-center gap-4">
+                <div className="w-16 h-16 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin"></div>
+                <span className="text-xs font-black text-indigo-400 uppercase tracking-[0.2em]">Synchronizing...</span>
+              </div>
+            )}
+            
+            <button onClick={onEnd} className="text-slate-400 text-sm font-bold hover:text-slate-600 underline">Exit Classroom</button>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <button onClick={() => setIsPaused(!isPaused)} className={`px-4 py-1.5 rounded-full text-sm font-bold transition-all shadow-sm flex items-center gap-2 ${isPaused ? 'bg-green-600 text-white' : 'bg-slate-900 text-white hover:bg-slate-800'}`}>
-            {isPaused ? '▶️ Resume' : '⏸️ Pause'}
+      )}
+
+      {/* Header with connection status */}
+      <div className="flex items-center justify-between mb-6 shrink-0 z-10">
+        <div className="flex items-center gap-4">
+          <div className={`w-12 h-12 rounded-2xl ${config.subject.color} flex items-center justify-center text-2xl shadow-lg ring-4 ring-white`}>{config.subject.icon}</div>
+          <div>
+            <h1 className="text-2xl font-black font-heading text-slate-900 leading-none mb-1">{config.subject.name}</h1>
+            <div className="flex items-center gap-2">
+               <p className="text-slate-500 text-xs font-bold uppercase tracking-widest">{config.grade}</p>
+               <span className="w-1.5 h-1.5 bg-slate-200 rounded-full"></span>
+               <div className="flex items-center gap-2">
+                  <div className={`w-2.5 h-2.5 rounded-full ${status === 'connected' ? 'bg-green-500 animate-pulse' : status === 'reconnecting' ? 'bg-amber-400 animate-spin' : 'bg-red-400'}`}></div>
+                  <span className="text-xs font-black text-slate-400 uppercase tracking-widest">
+                    {status === 'connected' ? 'Live Session' : status === 'reconnecting' ? 'Reconnecting...' : 'Offline'}
+                  </span>
+               </div>
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          {status === 'error' && (
+            <button onClick={() => connectToLiveAPI()} className="px-6 py-2 bg-amber-500 text-white rounded-full text-sm font-black shadow-lg shadow-amber-200 animate-pulse">Reconnect Now</button>
+          )}
+          <button onClick={() => { setViewMode('materials'); setHasNewMaterial(false); }} className={`px-5 py-2 rounded-full text-sm font-black relative transition-all ${viewMode === 'materials' ? 'bg-indigo-600 text-white shadow-xl scale-105' : 'bg-white text-slate-600 border border-indigo-50 hover:bg-indigo-50'}`}>
+            📖 Material
+            {hasNewMaterial && viewMode !== 'materials' && <span className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-red-500 rounded-full border-2 border-white animate-bounce"></span>}
           </button>
-          <div className="w-px h-6 bg-slate-200 mx-1"></div>
-          <button onClick={() => setViewMode('canvas')} className={`px-4 py-1.5 rounded-full text-sm font-bold transition-all shadow-sm ${viewMode === 'canvas' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'}`}>Whiteboard</button>
-          <button onClick={() => setViewMode('visualizer')} className={`px-4 py-1.5 rounded-full text-sm font-bold transition-all shadow-sm ${viewMode === 'visualizer' ? 'bg-indigo-600 text-white' : 'bg-white text-slate-600 hover:bg-slate-50'}`}>Focus</button>
-          <div className="w-px h-6 bg-slate-200 mx-1"></div>
-          <button onClick={onEnd} className="px-4 py-1.5 bg-red-50 text-red-600 rounded-full text-sm font-bold hover:bg-red-100 transition shadow-sm">End</button>
+          <button onClick={() => setViewMode('canvas')} className={`px-5 py-2 rounded-full text-sm font-black transition-all ${viewMode === 'canvas' ? 'bg-indigo-600 text-white shadow-xl scale-105' : 'bg-white text-slate-600 border border-indigo-50 hover:bg-indigo-50'}`}>🖌️ Board</button>
+          <button onClick={() => setViewMode('visualizer')} className={`px-5 py-2 rounded-full text-sm font-black transition-all ${viewMode === 'visualizer' ? 'bg-indigo-600 text-white shadow-xl scale-105' : 'bg-white text-slate-600 border border-indigo-50 hover:bg-indigo-50'}`}>✨ Focus</button>
+          <div className="w-px h-8 bg-slate-200 mx-1"></div>
+          <button onClick={onEnd} className="px-5 py-2 bg-red-50 text-red-600 rounded-full text-sm font-black hover:bg-red-100 transition-colors">Exit</button>
         </div>
       </div>
 
       <div className="flex-1 flex gap-6 overflow-hidden min-h-0 relative">
-        {isPaused && (
-          <div className="absolute inset-0 z-50 bg-slate-900/60 backdrop-blur-sm rounded-3xl flex flex-col items-center justify-center text-white animate-in fade-in zoom-in duration-300">
-            <div className="p-8 bg-slate-800 rounded-3xl shadow-2xl border border-slate-700 text-center space-y-6 max-w-sm">
-               <div className="text-6xl animate-pulse">⏸️</div>
-               <div className="space-y-2">
-                  <h2 className="text-2xl font-black uppercase tracking-tight">Session Paused</h2>
-                  <p className="text-slate-400 text-sm font-medium">Take a breath! EduSpark is waiting for you to come back.</p>
-               </div>
-               <button onClick={() => setIsPaused(false)} className="w-full py-4 bg-indigo-600 hover:bg-indigo-700 rounded-2xl font-black text-lg shadow-xl transition-all active:scale-95">RESUME LEARNING</button>
-            </div>
-          </div>
-        )}
-
-        <div className="flex-[3] flex flex-col gap-4 overflow-hidden">
-          <div className="flex-1 bg-white rounded-3xl shadow-lg border border-indigo-50 overflow-hidden relative flex flex-col">
-            {isConnecting ? (
-              <div className="flex-1 flex flex-col items-center justify-center space-y-4">
-                <div className="w-16 h-16 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div>
-                <p className="text-slate-500 font-medium font-heading">EduSpark is waking up...</p>
-              </div>
-            ) : viewMode === 'canvas' ? (
-              <Whiteboard ref={whiteboardRef} onFrame={handleWhiteboardFrame} />
-            ) : (
-              <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
-                <div className="mb-6">
-                  <AudioVisualizer isListening={!isSpeaking && !isPaused} isSpeaking={isSpeaking} />
+        <div className="flex-[3.5] flex flex-col gap-4 overflow-hidden">
+          {/* Main Workspace */}
+          <div className="flex-1 bg-white rounded-[3rem] shadow-2xl border border-indigo-50 overflow-hidden relative flex flex-col group transition-all duration-500">
+            {viewMode === 'canvas' ? (
+              <Whiteboard ref={whiteboardRef} onFrame={(b64) => { if (isConnectedRef.current) sessionRef.current?.sendRealtimeInput({ media: { data: b64, mimeType: 'image/jpeg' } }) }} />
+            ) : viewMode === 'materials' ? (
+              currentMaterial ? (
+                <div className="flex-1 flex flex-col overflow-y-auto p-10 bg-slate-50/20">
+                  <div className="max-w-5xl mx-auto w-full space-y-10">
+                    <h2 className="text-5xl font-medium text-slate-900 font-heading text-center leading-tight tracking-tight">{currentMaterial.title}</h2>
+                    <div className="relative rounded-[3rem] overflow-hidden shadow-[0_24px_48px_-8px_rgba(0,0,0,0.12)] border-[12px] border-white bg-slate-100 aspect-video flex items-center justify-center group/img">
+                      {currentMaterial.isGenerating ? (
+                        <div className="flex flex-col items-center gap-6 text-indigo-500">
+                          <div className="w-16 h-16 border-[6px] border-indigo-100 border-t-indigo-600 rounded-full animate-spin"></div>
+                          <p className="font-black animate-pulse uppercase text-xs tracking-[0.3em]">AI is drawing for you...</p>
+                        </div>
+                      ) : currentMaterial.imageUrl ? (
+                        <>
+                          <img src={currentMaterial.imageUrl} className="w-full h-full object-contain" alt="Lesson Visual" />
+                          <button 
+                            onClick={downloadMaterialImage}
+                            className="absolute top-6 right-6 p-4 bg-white/90 backdrop-blur-md shadow-xl rounded-2xl text-indigo-600 hover:bg-indigo-600 hover:text-white transition-all opacity-0 group-hover/img:opacity-100 flex items-center gap-2 font-bold text-sm"
+                          >
+                            <span>Download Visual</span>
+                            <span className="text-lg">💾</span>
+                          </button>
+                        </>
+                      ) : (
+                        <div className="text-slate-200 text-9xl">🏛️</div>
+                      )}
+                    </div>
+                    <div className="bg-white p-10 rounded-[3rem] shadow-xl text-slate-800 text-2xl font-normal whitespace-pre-wrap leading-relaxed border border-indigo-50/50">
+                      {currentMaterial.content}
+                    </div>
+                  </div>
                 </div>
-                <div className="max-w-md space-y-4">
-                  <h2 className="text-2xl font-bold text-slate-900">Learning in Progress</h2>
-                  <p className="text-slate-700 font-medium italic">" {transcriptState.user || '... listening ...'} "</p>
-                  <p className="text-indigo-700 font-bold text-xl leading-relaxed">{transcriptState.model}</p>
+              ) : (
+                <div className="flex-1 flex flex-col items-center justify-center text-center p-12">
+                   <div className="text-[8rem] mb-10 animate-pulse opacity-20">🏛️</div>
+                   <h3 className="text-5xl font-black text-slate-900 font-heading mb-6 tracking-tight">Interactive Canvas</h3>
+                   <p className="text-slate-400 text-2xl max-w-lg font-medium">Sit back and listen. Educational materials and diagrams will pop up here as the teacher speaks.</p>
+                </div>
+              )
+            ) : (
+              <div className="flex-1 flex flex-col items-center justify-center p-8 bg-gradient-to-b from-white to-indigo-50/20 relative">
+                <AudioVisualizer isListening={!isSpeaking && status === 'connected'} isSpeaking={isSpeaking} />
+                <div className="max-w-3xl w-full mt-12">
+                  <div className="p-12 bg-indigo-600 rounded-[3rem] shadow-[0_20px_50px_rgba(79,70,229,0.3)] border-b-[10px] border-indigo-800 transform transition-transform group-hover:scale-[1.02]">
+                     <p className="text-white font-medium text-5xl leading-[1.3] text-left">
+                       {transcriptState.model || (status === 'connected' ? 'Listening carefully...' : 'Waiting for connection...')}
+                     </p>
+                  </div>
                 </div>
               </div>
             )}
           </div>
 
-          <div ref={scrollRef} className="h-48 bg-sky-50 rounded-2xl p-4 overflow-y-auto space-y-4 border border-sky-100 shadow-inner scroll-smooth">
+          {/* Transcript History (Enhanced bubble contrast) */}
+          <div ref={scrollContainerRef} className="h-[26rem] bg-white/60 rounded-[2.5rem] p-6 overflow-y-auto space-y-6 border border-slate-200 shadow-inner backdrop-blur-sm transition-all duration-500">
              {messages.length === 0 && !transcriptState.user && !transcriptState.model && (
-               <div className="flex flex-col items-center justify-center h-full opacity-60">
-                  <div className="text-2xl mb-2">💬</div>
-                  <p className="text-sky-500 text-xs font-bold uppercase tracking-widest">Conversation Log</p>
-               </div>
+               <div className="h-full flex items-center justify-center text-slate-300 font-black uppercase tracking-widest text-xs">Lesson Transcript History</div>
              )}
              {messages.map(msg => (
                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                 <div className={`max-w-[85%] px-4 py-2 rounded-2xl text-sm shadow-sm ${msg.role === 'user' ? 'bg-indigo-500 text-white' : 'bg-white text-slate-800 border border-sky-200'}`}>
-                   <span className={`block text-[10px] mb-1 font-black uppercase tracking-tighter ${msg.role === 'user' ? 'text-indigo-100' : 'text-indigo-600'}`}>
-                     {msg.role === 'user' ? 'Student' : 'EduSpark'}
-                   </span>
-                   <p className="leading-relaxed font-medium">{msg.text}</p>
+                 <div className={`max-w-[90%] px-8 py-5 rounded-[2rem] font-normal shadow-sm transition-all hover:shadow-md ${msg.role === 'user' ? 'bg-indigo-500 text-white text-lg' : 'bg-white text-slate-800 border border-slate-200 text-2xl'}`}>
+                   {msg.text}
                  </div>
                </div>
              ))}
+             {/* Live Transcription Bubbles (Improved visibility) */}
              {transcriptState.user && (
                <div className="flex justify-end">
-                 <div className="max-w-[85%] px-4 py-2 rounded-2xl text-sm bg-indigo-600 text-white italic animate-pulse border border-indigo-400 shadow-lg">
-                   <span className="block text-[10px] mb-1 font-black uppercase tracking-tighter text-indigo-200">Listening...</span>
+                 <div className="px-8 py-4 rounded-[2rem] text-lg bg-indigo-50 text-indigo-900 font-medium italic animate-pulse border border-indigo-200 shadow-sm">
                    {transcriptState.user}
                  </div>
                </div>
              )}
              {transcriptState.model && (
                <div className="flex justify-start">
-                 <div className="max-w-[85%] px-4 py-2 rounded-2xl text-sm bg-white/90 text-slate-800 border border-sky-300 shadow-sm">
-                   <span className="block text-[10px] mb-1 font-black uppercase tracking-tighter text-indigo-600">EduSpark Speaking...</span>
+                 <div className="px-8 py-5 rounded-[2rem] text-2xl bg-slate-50 text-slate-900 border-2 border-indigo-200 font-medium shadow-md animate-in fade-in slide-in-from-left-4">
                    {transcriptState.model}
                  </div>
                </div>
@@ -325,36 +513,52 @@ const SessionUI: React.FC<SessionUIProps> = ({ config, onEnd }) => {
           </div>
         </div>
 
-        <div className="flex-1 flex flex-col gap-6 shrink-0">
-          <div className="bg-white rounded-3xl p-6 shadow-lg border border-indigo-50 flex flex-col items-center text-center space-y-4">
-            <div className={`w-24 h-24 rounded-full flex items-center justify-center text-5xl bg-gradient-to-br from-indigo-100 to-purple-100 shadow-inner border-4 border-white transition-transform duration-300 ${isSpeaking ? 'scale-110' : ''}`}>✨</div>
-            <div>
-              <h3 className="font-bold text-lg font-heading text-slate-900">EduSpark Tutor</h3>
-              <p className="text-xs text-slate-500 font-bold uppercase tracking-widest">K-12 Expert</p>
+        {/* Sidebar Controls */}
+        <div className="flex-1 shrink-0 space-y-6 flex flex-col">
+          <div className="bg-white rounded-[3rem] p-10 shadow-2xl border border-indigo-50 text-center space-y-8 flex-1 flex flex-col justify-center">
+            <div className="relative mx-auto w-fit">
+              <div className={`w-32 h-32 mx-auto rounded-full flex items-center justify-center text-7xl bg-indigo-50 shadow-inner border-[6px] border-white transition-all duration-500 ${isSpeaking ? 'scale-110 rotate-3 ring-[12px] ring-indigo-400/10' : ''}`}>🤖</div>
+              {status === 'connected' && <div className="absolute bottom-1 right-1 w-8 h-8 bg-green-500 rounded-full border-4 border-white animate-pulse"></div>}
             </div>
-            <div className="w-full space-y-2 pt-4 border-t border-slate-100">
-              <div className={`px-4 py-2 rounded-xl text-[10px] font-black flex items-center justify-between gap-2 uppercase tracking-tighter shadow-sm transition-colors ${isSpeaking ? 'bg-indigo-600 text-white animate-pulse' : 'bg-slate-100 text-slate-500'}`}>
-                <span>EDUSPARK VOICE</span>
-                <div className="flex gap-0.5 h-3 items-center">
-                   <div className={`w-1 h-full bg-current rounded-full ${isSpeaking ? 'animate-[bounce_0.8s_infinite]' : 'opacity-20'}`}></div>
-                   <div className={`w-1 h-full bg-current rounded-full ${isSpeaking ? 'animate-[bounce_1.1s_infinite]' : 'opacity-20'}`}></div>
-                   <div className={`w-1 h-full bg-current rounded-full ${isSpeaking ? 'animate-[bounce_0.9s_infinite]' : 'opacity-20'}`}></div>
-                </div>
-              </div>
-              <div className={`px-4 py-2 rounded-xl text-[10px] font-black flex items-center justify-between gap-2 uppercase tracking-tighter shadow-sm transition-colors ${!isSpeaking && !isPaused ? 'bg-green-600 text-white' : 'bg-slate-100 text-slate-500'}`}>
-                <span>MIC LISTENING</span>
-                <div className={`w-2 h-2 rounded-full ${!isSpeaking && !isPaused ? 'bg-white animate-ping' : 'bg-slate-300'}`}></div>
-              </div>
+            
+            <div className="space-y-2">
+               <h3 className="font-black text-slate-900 text-2xl font-heading tracking-tight">EduSpark AI</h3>
+               <p className="text-xs text-slate-400 font-black uppercase tracking-[0.3em]">Advanced Tutoring Engine</p>
+            </div>
+
+            <div className="w-full space-y-4 pt-8 border-t border-slate-100">
+               <div className={`px-5 py-4 rounded-[2rem] text-sm font-black flex items-center justify-between transition-all duration-500 ${isSpeaking ? 'bg-indigo-600 text-white shadow-lg' : 'bg-slate-50 text-slate-400'}`}>
+                 <span>TEACHER</span>
+                 <div className="flex gap-1.5 h-6 items-end">
+                    {[0, 1, 2, 3, 4].map(i => <div key={i} className={`w-1.5 bg-current rounded-full transition-all ${isSpeaking ? 'animate-[bounce_1s_infinite]' : 'h-1.5'}`} style={{ animationDelay: `${i*0.12}s`, minHeight: '6px' }}></div>)}
+                 </div>
+               </div>
+               
+               <div className={`px-5 py-4 rounded-[2rem] text-sm font-black flex items-center justify-between transition-all duration-500 ${!isSpeaking && status === 'connected' ? 'bg-green-600 text-white shadow-lg' : 'bg-slate-50 text-slate-400'}`}>
+                 <span>STUDENT</span>
+                 <div className="flex items-center gap-3">
+                   {status === 'connected' && !isSpeaking && <div className="text-[10px] font-black mr-1 animate-pulse tracking-tighter">LISTENING...</div>}
+                   <div className={`w-4 h-4 rounded-full ${!isSpeaking && status === 'connected' ? 'bg-white animate-ping' : 'bg-slate-300'}`}></div>
+                 </div>
+               </div>
             </div>
           </div>
-          <div className="flex-1 bg-indigo-600 rounded-3xl p-6 text-white shadow-xl overflow-hidden relative group">
-            <div className="absolute top-0 right-0 -mr-8 -mt-8 w-32 h-32 bg-white/10 rounded-full blur-2xl group-hover:scale-150 transition-transform duration-700"></div>
-            <h4 className="font-bold text-sm mb-4 flex items-center gap-2"><span className="p-1 bg-white/20 rounded-md">💡</span> Pro Tutor Tips</h4>
-            <ul className="text-xs space-y-4 font-medium">
-              <li className="flex gap-3 leading-relaxed"><span className="text-indigo-200">01.</span><span>The whiteboard is shared! Write or draw and ask me for feedback.</span></li>
-              <li className="flex gap-3 leading-relaxed"><span className="text-indigo-200">02.</span><span>I can draw on the board too! Ask me to diagram a concept for you.</span></li>
-              <li className="flex gap-3 leading-relaxed"><span className="text-indigo-200">03.</span><span>Need a break? Hit the Pause button at any time.</span></li>
-            </ul>
+          
+          <div className="p-8 bg-indigo-600 rounded-[3rem] shadow-xl text-white overflow-hidden relative group">
+             <div className="absolute top-0 right-0 p-4 opacity-20 transform translate-x-4 -translate-y-4 group-hover:translate-x-0 group-hover:translate-y-0 transition-transform">✨</div>
+             <h4 className="text-[11px] font-black text-indigo-200 uppercase tracking-[0.25em] mb-4 text-center">Class Activity Monitor</h4>
+             <div className="flex justify-center items-end gap-1.5 h-12">
+                {[...Array(14)].map((_, i) => (
+                  <div 
+                    key={i} 
+                    className={`w-1.5 rounded-full transition-all duration-300 ${status === 'connected' ? 'bg-white' : 'bg-indigo-400'}`} 
+                    style={{ 
+                      height: status === 'connected' ? `${20 + Math.random() * 80}%` : '15%',
+                      opacity: 0.3 + (Math.random() * 0.7)
+                    }}
+                  ></div>
+                ))}
+             </div>
           </div>
         </div>
       </div>

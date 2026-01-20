@@ -94,6 +94,16 @@ const Whiteboard = forwardRef<WhiteboardHandle, WhiteboardProps>(({ onFrame }, r
     }
   };
 
+  const downloadCanvas = () => {
+    const canvas = canvasRef.current;
+    if (canvas) {
+      const link = document.createElement('a');
+      link.download = `eduspark-whiteboard-${Date.now()}.png`;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    }
+  };
+
   const loadFromLocalStorage = () => {
     const savedData = localStorage.getItem(PERSISTENCE_KEY);
     if (savedData) {
@@ -355,8 +365,9 @@ const Whiteboard = forwardRef<WhiteboardHandle, WhiteboardProps>(({ onFrame }, r
             ))}
           </div>
           <div className="flex gap-1">
-             <button onClick={saveToLocalStorage} className="p-1.5 text-[10px] font-black bg-indigo-50 text-indigo-600 rounded-lg hover:bg-indigo-100 transition shadow-sm border border-indigo-100">SAVE</button>
-            <button onClick={() => clearCanvas()} className="p-1.5 text-[10px] font-black bg-red-50 text-red-500 rounded-lg hover:bg-red-100 transition shadow-sm border border-red-100">CLEAR</button>
+             <button onClick={saveToLocalStorage} className="p-1.5 text-[10px] font-black bg-indigo-50 text-indigo-600 rounded-lg hover:bg-indigo-100 transition shadow-sm border border-indigo-100" title="Auto-save to browser storage">AUTO-SAVE</button>
+             <button onClick={downloadCanvas} className="p-1.5 text-[10px] font-black bg-green-50 text-green-600 rounded-lg hover:bg-green-100 transition shadow-sm border border-green-100">DOWNLOAD</button>
+             <button onClick={() => clearCanvas()} className="p-1.5 text-[10px] font-black bg-red-50 text-red-500 rounded-lg hover:bg-red-100 transition shadow-sm border border-red-100">CLEAR</button>
           </div>
         </div>
       </div>
